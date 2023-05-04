@@ -1,0 +1,382 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# AT Protocol
+
+```elixir
+Mix.install([
+  {:req, "~> 0.3.6"},
+  {:nimble_parsec, "~> 1.3"},
+  {:ecto, "~> 3.10"}
+])
+```
+
+## NSID
+
+```elixir
+defmodule NSID do
+  @moduledoc """
+    Grammar:
+    alpha     = "a" / "b" / "c" / "d" / "e" / "f" / "g" / "h" / "i" / "j" / "k" / "l" / "m" / "n" / "o" / "p" / "q" / "r" / "s" / "t" / "u" / "v" / "w" / "x" / "y" / "z" / "A" / "B" / "C" / "D" / "E" / "F" / "G" / "H" / "I" / "J" / "K" / "L" / "M" / "N" / "O" / "P" / "Q" / "R" / "S" / "T" / "U" / "V" / "W" / "X" / "Y" / "Z"
+    number    = "1" / "2" / "3" / "4" / "5" / "6" / "7" / "8" / "9" / "0"
+    delim     = "."
+    segment   = alpha *( alpha / number / "-" )
+    authority = segment *( delim segment )
+    name      = segment
+    nsid      = authority delim name
+    nsid-ns   = authority delim "*"
+  """
+  import NimbleParsec
+  defstruct [:authority, :name]
+
+  alpha = ascii_string([?a..?z, ?A..?Z], min: 1)
+  ascii = ascii_string([?a..?z, ?A..?Z, ?0..?9, ?-], min: 1)
+  delim = string(".")
+  ns = string("*")
+
+  segment =
+    alpha
+    |> repeat(ascii)
+    |> lookahead(choice([delim, eos()]))
+    |> reduce({Enum, :join, [""]})
+
+  authority =
+    segment
+    |> ignore(delim)
+    |> concat(segment)
+    |> post_traverse({__MODULE__, :check_authority, []})
+    |> tag(:authority)
+
+  name =
+    choice([ignore(delim), segment, ns])
+    |> times(min: 1)
+    |> post_traverse({__MODULE__, :check_name, []})
+    |> tag(:name)
+
+  nsid =
+    authority
+    |> ignore(delim)
+    |> concat(name)
+    |> reduce({__MODULE__, :to_nsid, []})
+
+  defparsecp(:parser, nsid)
+
+  def to_nsid(args) do
+    [auth] = Keyword.get(args, :authority)
+    [name] = Keyword.get(args, :name)
+
+    %NSID{
+      authority: auth,
+      name: name
+    }
+  end
+
+  def check_name(rest, args, context, _line, _offset) do
+    name = args |> Enum.reverse() |> Enum.join(".")
+
+    if String.length(name) > 128 do
+      {:error, "NSID name part too long (max 128 chars)"}
+    else
+      {rest, [name], context}
+    end
+  end
+
+  def check_authority(rest, args, context, _line, _offset) do
+    auth = args |> Enum.join(".")
+
+    if String.length(auth) > 63 do
+      {:error, "NSID authority part too long (max 63 chars)"}
+    else
+      {rest, [auth], context}
+    end
+  end
+
+  @doc ~S"""
+  ## Examples
+
+      iex> NSID.parse("com.example.bar")
+      %NSID{authority: "example.com", name: "bar"}
+
+      iex> NSID.parse("com.example.*")
+      %NSID{authority: "example.com", name: "*"}
+
+      iex> NSID.parse("com.long-thing1.cool.fooBarBaz")
+      %NSID{authority: "long-thing1.com", name: "cool.fooBarBaz"}
+
+      iex> NSID.parse("onion.g2zyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.lex.deleteThing")
+      %NSID{authority: "g2zyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion", name: "lex.deleteThing"}
+    
+  """
+  def parse(str) do
+    {:ok, [val], _, _, _, _} = parser(str)
+    true = is_valid?(str)
+    val
+  end
+
+  @doc ~S"""
+  ## Examples
+
+      iex> NSID.create("example.com, "bar")
+      %NSID{authority: "example.com", name: "bar"}
+
+      iex> NSID.create("example.com", "*")
+      %NSID{authority: "example.com", name: "*"}
+
+      iex> NSID.create("long-thing1.com", "cool.fooBarBaz")
+      %NSID{authority: "long-thing1.com", name: "cool.fooBarBaz"}
+  """
+  def create(a, n) do
+    %NSID{
+      authority: a,
+      name: n
+    }
+  end
+
+  @doc ~S"""
+  ## Examples
+
+      iex> NSID.create("example.com", "bar")
+      %NSID{authority: "example.com", name: "bar"}
+
+      iex> NSID.create("example.com", "*")
+      %NSID{authority: "example.com", name: "*"}
+
+      iex> NSID.create("long-thing1.com", "cool.fooBarBaz")
+      %NSID{authority: "long-thing1.com", name: "cool.fooBarBaz"}
+  """
+  def create(a, n) do
+    %NSID{
+      authority: a,
+      name: n
+    }
+  end
+
+  @doc ~S"""
+  ## Examples
+
+      iex> NSID.to_string(%NSID{authority: "example.com", name: "bar"})
+      "com.example.bar"
+      
+      iex> NSID.to_string(%NSID{authority: "example.com", name: "*"})
+      "com.example.*"
+
+      iex> NSID.to_string(%NSID{authority: "long-thing1.com", name: "cool.fooBarBaz"})
+      "com.long-thing1.cool.fooBarBaz"
+  """
+  defdelegate to_string(uri), to: String.Chars.NSID
+
+  @doc ~S"""
+  ## Examples
+      iex> NSID.is_valid?("com.example.bar")
+      true
+
+      iex> NSID.is_valid?("com.example.*")
+      true
+
+      iex> NSID.is_valid?("com.long-thing1.cool.fooBarBaz")
+      true 
+
+      iex> NSID.is_valid?("onion.g2zyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.lex.deleteThing")
+      true
+
+      iex> NSID.is_valid?("cn.8.lex.stuff")
+      {:error, "expected ASCII character in the range \"a\" to \"z\" or in the range \"A\" to \"Z\" at 8.lex.stuff"}
+
+      iex> NSID.is_valid?("example.com")
+      {:error, "expected string \".\""}
+
+      iex> NSID.is_valid?(Enum.join(["com", "ex", Enum.map(0..1000, fn _ -> "P" end)], "."))
+      {:error, "NSID is too long (382 chars max)"}
+      
+      iex> NSID.is_valid?(Enum.join(["com", "ex", Enum.map(0..129, fn _ -> "P" end)], "."))
+      {:error, "NSID name part too long (max 128 chars)"}
+  """
+  def is_valid?(str) when is_binary(str) and byte_size(str) > 382 do
+    {:error, "NSID is too long (382 chars max)"}
+  end
+
+  def is_valid?(str) do
+    case parser(str) do
+      {:ok, _, _, _, _, _} -> true
+      {:error, msg, str, _, _, _} when is_binary(str) and byte_size(str) == 0 -> {:error, msg}
+      {:error, msg, char, _, _, _} -> {:error, msg <> " at " <> char}
+    end
+  end
+end
+
+defimpl String.Chars, for: NSID do
+  def to_string(%{authority: a, name: n}) do
+    auth = String.split(a, ".") |> Enum.reverse() |> Enum.intersperse(?.)
+
+    IO.iodata_to_binary([
+      auth,
+      ?.,
+      n
+    ])
+  end
+end
+```
+
+## XRPC BSKY
+
+```elixir
+defmodule XRPC do
+  def new(base_url, token \\ nil) do
+    if token do
+      Req.new(
+        base_url: base_url <> "/xrpc",
+        auth: {:bearer, token}
+      )
+    else
+      Req.new(base_url: base_url <> "/xrpc")
+    end
+  end
+
+  def query(req, nsid, params, opts \\ []) do
+    Req.get(
+      req,
+      Keyword.merge(opts,
+        url: nsid,
+        params: params
+      )
+    )
+  end
+
+  def procedure(req, nsid, body, opts \\ []) do
+    Req.post(
+      req,
+      Keyword.merge(opts,
+        url: nsid,
+        json: body
+      )
+    )
+  end
+end
+
+Application.put_env(:logger, :log_level, :debug)
+```
+
+```elixir
+client = XRPC.new("https://bsky.social")
+
+{:ok, resp} =
+  XRPC.procedure(client, "com.atproto.server.createSession", %{
+    identifier: "peregrine.bsky.social",
+    password: System.fetch_env!("LB_BLUESKY_TOKEN")
+  })
+
+body = resp.body
+token = body["accessJwt"]
+client = XRPC.new("https://bsky.social", token)
+```
+
+```elixir
+{:ok, resp} = XRPC.query(client, "app.bsky.feed.post", actor: "peregrine.bsky.social")
+
+resp.body
+```
+
+```elixir
+{:ok, resp} =
+  XRPC.procedure(client, "com.atproto.repo.createRecord", %{
+    repo: "peregrine.bsky.social",
+    collection: "app.bsky.feed.post",
+    record: %{
+      text: "Hello world from elixir",
+      createdAt: DateTime.utc_now()
+    }
+  })
+
+body = resp.body
+```
+
+## XRPC Codegen
+
+```elixir
+body =
+  Req.get!(
+    "https://api.github.com/repos/bluesky-social/atproto/git/trees/1e24d3e820f75e0ad86ea6f9e5ebf181a9c8c88e?recursive=true"
+  ).body
+```
+
+```elixir
+res =
+  Enum.filter(Map.get(body, "tree"), fn m ->
+    path = Map.get(m, "path")
+    String.contains?(path, "lexicons") && String.contains?(path, "json")
+  end)
+  |> Enum.map(fn m ->
+    {m, Req.get!(Map.get(m, "url"), auth: {:bearer, System.fetch_env!("LB_GITHUB_TOKEN")})}
+  end)
+```
+
+```elixir
+lexicon =
+  Enum.map(res, fn {_j, req} ->
+    Map.get(req.body, "content")
+    |> String.split("\n")
+    |> Enum.map(fn d -> Base.decode64!(d) end)
+    |> Enum.join("")
+    |> Jason.decode!()
+  end)
+
+Application.put_env(:app, :lexicon, lexicon)
+```
+
+```elixir
+defmodule XRPC.Lexicon do
+  defmacro __using__(_) do
+    queries =
+      Enum.filter(Application.get_env(:app, :lexicon), fn l ->
+        get_in(l, ["defs", "main", "type"]) == "query"
+      end)
+
+    for l <- queries do
+      parameters = get_in(l, ["defs", "main", "parameters"])
+      properties = parameters["properties"] || []
+
+      types =
+        Enum.map(properties, fn {key, val} ->
+          {String.to_atom(key), __MODULE__.type_to_ecto(val)}
+        end)
+        |> Enum.into(%{})
+
+      required = (parameters["required"] || []) |> Enum.map(&String.to_atom/1)
+
+      quote do
+        def query(client, unquote(l["id"]) = id, params) do
+          types = unquote(Macro.escape(types))
+
+          changeset =
+            {%{}, types}
+            |> Ecto.Changeset.cast(params, Map.keys(types))
+            |> Ecto.Changeset.validate_required(unquote(Macro.escape(required)))
+
+          if changeset.valid? do
+            with {:ok, resp} <- XRPC.query(client, id, changeset.changes) do
+              resp.body
+            end
+          else
+            {:error, changeset.errors}
+          end
+        end
+      end
+    end
+  end
+
+  def type_to_ecto(%{"type" => "string"}), do: :string
+  def type_to_ecto(%{"type" => "boolean"}), do: :boolean
+  def type_to_ecto(%{"type" => "integer"}), do: :integer
+  def type_to_ecto(%{"type" => "number"}), do: :float
+  def type_to_ecto(%{"type" => "array"} = val), do: {:array, type_to_ecto(val["items"])}
+end
+
+defmodule Blsky do
+  use XRPC.Lexicon
+end
+```
+
+```elixir
+Blsky.query(client, "app.bsky.actor.getProfile", %{actor: "peregrine.bsky.social"})
+```
+
+<!-- livebook:{"offset":9425,"stamp":{"token":"QTEyOEdDTQ.-fVBZ59bV43ANjQJ8JD4XHRPT6KpmESfVXiY-TfU304Un64wwYaDqPdp2tE.Wm-YMWb-K35qfaEc.Uvz03Q_08HI9hMYxEm2I-Qs-GfCMJb_lQheoLUWJql_s74WWxOjfj4tMEJI9xfk3wwCFxJXqwaBgOugHhL-Lz2Ld.Mhj0AcXgoyzbeEa6URRByw","version":1}} -->
